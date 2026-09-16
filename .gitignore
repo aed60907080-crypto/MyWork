@@ -1,0 +1,13 @@
+# ملفات الاختبار المؤقتة
+_*.html
+
+# ملفات النظام والمحررات
+.DS_Store
+Thumbs.db
+desktop.ini
+.vscode/
+.idea/
+
+# أسرار — لا تُرفع أبداً
+.env
+*.key
