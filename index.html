@@ -721,24 +721,61 @@ document.addEventListener("click",ev=>{
 });
 
 /* ============================================================
-   3. طبقة التخزين — قاعدة بيانات مشتركة أو تخزين محلي
+   3. طبقة التخزين — قاعدة بيانات مستقلة لكل موقع
+   كل موقع له قاعدته: sites/MB/… للمبنى الرئيسي و sites/GC/… للمركز الحكومي.
+   الجهة لا تفتح إلا قاعدة موقعها، ورئيس القسم وحده يفتح القاعدتين وتُجمعان عنده.
+   المشترك بين الموقعين: القوائم وكلمات السر والفنيون المسجّلون «لكلا الموقعين».
    ============================================================ */
 const COLS = ["records","parts","movements","technicians","reports","employees","locations"];
+const SITE_BY_CODE = {MB:SITES[0], GC:SITES[1]};
+function colPath(col,code){ return code ? "sites/"+code+"/"+col : col; }
+/* رمز قاعدة الموقع التي يُحفظ فيها المستند — "" للفنيين المشتركين بين الموقعين */
+function codeFor(col,o){
+  o=o||{};
+  if(SITE_CODE[o.site]) return SITE_CODE[o.site];
+  if(col==="reports" && SITE_BY_CODE[o.scope]) return o.scope;
+  return "";
+}
 const Store = {
   mode:"local", db:null, ready:false,
+  open:[], sitesReady:false,
   cache:{records:[],parts:[],movements:[],technicians:[],reports:[],employees:[],locations:[]},
+  _parts:{},
+  _unsubs:[], _gen:0,
   config:JSON.parse(JSON.stringify(DEFAULT_CONFIG)),
   access:{},
   _subs:[],
   on(fn){ this._subs.push(fn); },
   emit(){ this._subs.forEach(f=>{ try{ f(); }catch(e){ console.error(e); } }); },
   list(col){ return this.cache[col]||[]; },
-  async exists(col,id){
+  openNames(){ return SITES.filter(s=>this.open.indexOf(SITE_CODE[s])>=0); },
+
+  /* دمج أجزاء المجموعة القادمة من قواعد المواقع المفتوحة */
+  _rebuild(col){
+    const parts=this._parts[col]||{};
+    let rows=[];
+    Object.keys(parts).forEach(k=>{ rows=rows.concat(parts[k]); });
+    if(col==="records")   rows.sort((a,b)=>String(b.date||"").localeCompare(String(a.date||"")));
+    if(col==="movements") rows.sort((a,b)=>String(b.ts||"").localeCompare(String(a.ts||"")));
+    this.cache[col]=rows;
+  },
+  _setPart(col,code,rows){
+    this._parts[col]=this._parts[col]||{};
+    this._parts[col][code]=rows;
+    this._rebuild(col);
+  },
+  /* في أي قاعدة يوجد المستند حالياً */
+  _where(col,id){
+    const parts=this._parts[col]||{};
+    return Object.keys(parts).find(k=>parts[k].some(x=>x.id===id));
+  },
+  async exists(col,id,site){
+    const code=SITE_CODE[site]||"";
     if(this.mode==="db"){
-      try{ const snap=await this.db.collection(col).doc(id).get(); return !!snap.exists; }
+      try{ const snap=await this.db.collection(colPath(col,code)).doc(id).get(); return !!snap.exists; }
       catch(e){ return true; } /* عند الشك لا نكتب فوق مستند قائم */
     }
-    return !!(this.cache[col]||[]).find(x=>x.id===id);
+    return !!((this._parts[col]||{})[code]||[]).find(x=>x.id===id);
   },
 
   async init(){
@@ -747,9 +784,10 @@ const Store = {
     if(db){ this.db=db; this.mode="db"; await this._initDb(); }
     else { this.mode="local"; this._initLocal(); }
     this.ready=true; this.emit();
+    if(this.mode==="db") this._migrateDb();
   },
 
-  /* ---------- قاعدة بيانات مشتركة بين كل المستخدمين ---------- */
+  /* ---------- القوائم وكلمات السر: مشتركة ---------- */
   async _initDb(){
     const db=this.db;
     const cfgRef = db.doc("config/lists");
@@ -769,23 +807,82 @@ const Store = {
     try{ const a=await accRef.get(); if(a.exists) this.access=a.data()||{}; }
     catch(e){ console.warn("access", e); }
     accRef.onSnapshot(s=>{ if(s.exists){ this.access=s.data()||{}; this.emit(); } }, e=>console.warn("acc-sub", e));
-
-    COLS.forEach(col=>{
-      let q = db.collection(col);
-      if(col==="records")   q = q.orderBy("date","desc").limit(1000);
-      if(col==="movements") q = q.orderBy("ts","desc").limit(600);
-      q.onSnapshot(snap=>{
-        this.cache[col] = snap.docs.map(d=>Object.assign({id:d.id}, d.data()));
-        this.emit();
-      }, e=>console.warn(col, e));
-    });
   },
 
-  /* ---------- تخزين محلي احتياطي ---------- */
+  /* ---------- فتح قواعد المواقع المسموحة للجهة فقط ---------- */
+  openSites(sites){
+    if(!this.ready) return;
+    const codes=(sites||[]).map(s=>SITE_CODE[s]).filter(Boolean).sort();
+    if(this._opened && this.open.join()===codes.join()) return;
+    this.closeSites(true);
+    this._opened=true; this.open=codes;
+    const gen=this._gen;
+    const wanted=[];
+    codes.forEach(code=>COLS.forEach(col=>wanted.push([col,code])));
+    wanted.push(["technicians",""]); /* الفنيون المشتركون بين الموقعين */
+
+    if(this.mode==="db"){
+      let pending=wanted.length;
+      wanted.forEach(([col,code])=>{
+        let q=this.db.collection(colPath(col,code));
+        if(col==="records")   q=q.orderBy("date","desc").limit(1000);
+        if(col==="movements") q=q.orderBy("ts","desc").limit(600);
+        let first=true;
+        const un=q.onSnapshot(snap=>{
+          if(gen!==this._gen) return;
+          let rows=snap.docs.map(d=>Object.assign({id:d.id}, d.data()));
+          if(col==="technicians" && !code) rows=rows.filter(t=>!SITE_CODE[t.site]);
+          this._setPart(col,code,rows);
+          if(first){ first=false; if(--pending===0) this.sitesReady=true; }
+          this.emit();
+        }, e=>{ console.warn(colPath(col,code), e); if(first){ first=false; if(--pending===0) this.sitesReady=true; } });
+        this._unsubs.push(un);
+      });
+    }else{
+      wanted.forEach(([col,code])=>{
+        let rows=[];
+        try{ rows=JSON.parse(localStorage.getItem(this._key(col,code))||"[]"); }catch(e){}
+        this._setPart(col,code,rows);
+      });
+      this.sitesReady=true;
+      setTimeout(()=>{ if(gen===this._gen) this.emit(); },0);
+    }
+  },
+  closeSites(quiet){
+    this._unsubs.forEach(u=>{ try{ u(); }catch(e){} });
+    this._unsubs=[]; this._gen++;
+    this._opened=false; this.open=[]; this.sitesReady=false;
+    this._parts={};
+    COLS.forEach(c=>{ this.cache[c]=[]; });
+    if(!quiet) this.emit();
+  },
+
+  /* ---------- تخزين محلي احتياطي: مفتاح مستقل لكل موقع ---------- */
+  _key(col,code){ return "mpw."+(code?code+".":"")+col; },
   _initLocal(){
-    COLS.forEach(col=>{
-      try{ this.cache[col]=JSON.parse(localStorage.getItem("mpw."+col)||"[]"); }catch(e){ this.cache[col]=[]; }
-    });
+    /* نقل البيانات القديمة (مفتاح واحد للموقعين) إلى مفتاح كل موقع */
+    try{
+      COLS.forEach(col=>{
+        const raw=localStorage.getItem("mpw."+col);
+        if(!raw) return;
+        const rows=JSON.parse(raw)||[], keep=[];
+        const moved={};
+        rows.forEach(r=>{
+          const code=codeFor(col,r);
+          if(code){ (moved[code]=moved[code]||[]).push(r); }
+          else keep.push(r);
+        });
+        Object.keys(moved).forEach(code=>{
+          const k=this._key(col,code);
+          const cur=JSON.parse(localStorage.getItem(k)||"[]");
+          const ids=new Set(cur.map(x=>x.id));
+          localStorage.setItem(k, JSON.stringify(cur.concat(moved[code].filter(x=>!ids.has(x.id)))));
+        });
+        /* الفنيون المشتركون يبقون في مفتاحهم؛ ما لا موقع له من غيرهم يُترك كما هو */
+        if(col==="technicians" || keep.length) localStorage.setItem("mpw."+col, JSON.stringify(keep));
+        else localStorage.removeItem("mpw."+col);
+      });
+    }catch(e){ console.warn("local-migrate", e); }
     try{
       const c=localStorage.getItem("mpw.config");
       if(c) this.config=Object.assign(JSON.parse(JSON.stringify(DEFAULT_CONFIG)), JSON.parse(c));
@@ -795,31 +892,91 @@ const Store = {
       if(a) this.access=JSON.parse(a)||{};
     }catch(e){}
   },
-  _flush(col){
-    try{ localStorage.setItem("mpw."+col, JSON.stringify(this.cache[col])); }
+  _flush(col,code){
+    try{ localStorage.setItem(this._key(col,code), JSON.stringify(((this._parts[col]||{})[code])||[])); }
     catch(e){ toast("تعذّر الحفظ محلياً — المساحة ممتلئة"); }
   },
 
-  /* ---------- كتابة ---------- */
+  /* ---------- نقل ما كُتب في القاعدة المشتركة القديمة إلى قاعدة موقعه (مرة واحدة) ---------- */
+  async _migrateDb(){
+    const db=this.db, ref=db.doc("config/migration");
+    try{
+      const s=await ref.get();
+      if(s.exists && s.data().sitesV1) return;
+      const lease=await ref.acquire({holder:uid("mig"), ttlMs:120000});
+      if(!lease || !lease.acquired) return;
+      const photoSite={};
+      let moved=0;
+      for(const col of COLS){
+        const snap=await db.collection(col).get();
+        for(const d of snap.docs){
+          const body=d.data(), code=codeFor(col,body);
+          if(col==="records" && body.photoId && code) photoSite[body.photoId]=code;
+          if(!code) continue;
+          await db.collection(colPath(col,code)).doc(d.id).set(body);
+          await db.collection(col).doc(d.id).delete();
+          moved++;
+        }
+      }
+      const ph=await db.collection("photos").get();
+      for(const d of ph.docs){
+        const code=photoSite[d.id]; if(!code) continue;
+        await db.collection(colPath("photos",code)).doc(d.id).set(d.data());
+        await db.collection("photos").doc(d.id).delete();
+        moved++;
+      }
+      const cnt=await db.doc("config/counters").get();
+      if(cnt.exists){
+        const data=cnt.data()||{};
+        for(const code of Object.keys(SITE_BY_CODE)){
+          const mine={};
+          Object.keys(data).forEach(k=>{ if(k.indexOf(code+"-")===0) mine[k]=data[k]; });
+          if(Object.keys(mine).length){
+            const cref=db.doc("sites/"+code+"/meta/counters"), cur=await cref.get();
+            await cref.set(Object.assign({}, mine, cur.exists?cur.data():{}));
+          }
+        }
+      }
+      await ref.set({sitesV1:true, at:new Date().toISOString(), moved:moved});
+    }catch(e){ console.warn("migrate", e); }
+  },
+
+  /* ---------- كتابة: كل مستند إلى قاعدة موقعه ---------- */
   async save(col,obj){
     const o=Object.assign({},obj);
     if(!o.id) o.id=uid(col.slice(0,3));
     o.updatedAt=new Date().toISOString();
+    const code=codeFor(col,o);
+    if(!code && col!=="technicians"){
+      toast("تعذّر تحديد موقع السجل — لم يُحفظ");
+      throw new Error("save without site: "+col);
+    }
+    const prev=this._where(col,o.id);
     if(this.mode==="db"){
       const body=Object.assign({},o); delete body.id;
-      await this.db.collection(col).doc(o.id).set(body);
+      await this.db.collection(colPath(col,code)).doc(o.id).set(body);
+      /* نُقل إلى موقع آخر: يُحذف من قاعدة الموقع السابق */
+      if(prev!==undefined && prev!==code) await this.db.collection(colPath(col,prev)).doc(o.id).delete();
     }else{
-      const arr=this.cache[col], i=arr.findIndex(x=>x.id===o.id);
+      this._parts[col]=this._parts[col]||{};
+      if(prev!==undefined && prev!==code){
+        this._parts[col][prev]=this._parts[col][prev].filter(x=>x.id!==o.id);
+        this._flush(col,prev);
+      }
+      const arr=this._parts[col][code]=this._parts[col][code]||[];
+      const i=arr.findIndex(x=>x.id===o.id);
       if(i>=0) arr[i]=o; else arr.unshift(o);
-      this._flush(col); this.emit();
+      this._flush(col,code); this._rebuild(col); this.emit();
     }
     return o.id;
   },
   async remove(col,id){
-    if(this.mode==="db"){ await this.db.collection(col).doc(id).delete(); }
+    const code=this._where(col,id);
+    if(code===undefined) return;
+    if(this.mode==="db"){ await this.db.collection(colPath(col,code)).doc(id).delete(); }
     else{
-      this.cache[col]=this.cache[col].filter(x=>x.id!==id);
-      this._flush(col); this.emit();
+      this._parts[col][code]=this._parts[col][code].filter(x=>x.id!==id);
+      this._flush(col,code); this._rebuild(col); this.emit();
     }
   },
   async saveConfig(cfg){
@@ -836,36 +993,39 @@ const Store = {
     this.emit();
   },
 
-  /* ---------- الصور: مستند منفصل لكل صورة كي تبقى السجلات خفيفة ---------- */
-  async savePhoto(id,dataUrl){
-    if(this.mode==="db"){ await this.db.collection("photos").doc(id).set({dataUrl:dataUrl, at:new Date().toISOString()}); }
+  /* ---------- الصور: مستند منفصل لكل صورة داخل قاعدة موقع السجل ---------- */
+  async savePhoto(site,id,dataUrl){
+    const code=SITE_CODE[site]||"";
+    if(this.mode==="db"){ await this.db.collection(colPath("photos",code)).doc(id).set({dataUrl:dataUrl, at:new Date().toISOString()}); }
     else{
-      try{ localStorage.setItem("mpw.photo."+id,dataUrl); }
+      try{ localStorage.setItem(this._key("photo."+id,code),dataUrl); }
       catch(e){ toast("تعذّر حفظ الصورة محلياً — حُفظ السجل بدونها"); return false; }
     }
   },
-  async getPhoto(id){
+  async getPhoto(site,id){
     if(!id) return null;
+    const code=SITE_CODE[site]||"";
     if(this.mode==="db"){
-      try{ const s=await this.db.collection("photos").doc(id).get(); return s.exists ? s.data().dataUrl : null; }
+      try{ const s=await this.db.collection(colPath("photos",code)).doc(id).get(); return s.exists ? s.data().dataUrl : null; }
       catch(e){ return null; }
     }
-    return localStorage.getItem("mpw.photo."+id);
+    return localStorage.getItem(this._key("photo."+id,code)) || localStorage.getItem("mpw.photo."+id);
   },
-  async delPhoto(id){
+  async delPhoto(site,id){
     if(!id) return;
-    if(this.mode==="db"){ try{ await this.db.collection("photos").doc(id).delete(); }catch(e){} }
-    else localStorage.removeItem("mpw.photo."+id);
+    const code=SITE_CODE[site]||"";
+    if(this.mode==="db"){ try{ await this.db.collection(colPath("photos",code)).doc(id).delete(); }catch(e){} }
+    else{ localStorage.removeItem(this._key("photo."+id,code)); localStorage.removeItem("mpw.photo."+id); }
   },
 
-  /* ---------- رقم السجل: رمز الموقع + السنة/الشهر + تسلسل ---------- */
+  /* ---------- رقم السجل: رمز الموقع + السنة/الشهر + تسلسل، والعدّاد داخل قاعدة الموقع ---------- */
   async nextNo(site,date){
     const pre = SITE_CODE[site]+"-"+String(date).slice(2,4)+String(date).slice(5,7)+"-";
     const localMax = ()=> this.list("records")
       .filter(r=>String(r.no||"").indexOf(pre)===0)
       .reduce((m,r)=>Math.max(m, n(String(r.no).split("-")[2])),0);
     if(this.mode==="db"){
-      const ref=this.db.doc("config/counters"), holder=uid("h");
+      const ref=this.db.doc("sites/"+SITE_CODE[site]+"/meta/counters"), holder=uid("h");
       for(let i=0;i<4;i++){
         try{
           const res=await ref.acquire({holder:holder, ttlMs:4000});
@@ -970,6 +1130,7 @@ const Access={
     Object.assign(Sup,{tab:"passwords", q:"", site:"", dept:"", pq:"", psite:""});
     try{ sessionStorage.removeItem("mpw.session"); }catch(e){}
     try{ localStorage.removeItem("mpw.session"); }catch(e){}
+    Store.closeSites(true);
     render();
   },
   restore(){
@@ -1642,7 +1803,7 @@ async function openRecord(id){
     actions:[
       {label:"حذف", cls:"btn danger", act:()=>{
         confirmBox("حذف أمر الصيانة","سيُحذف السجل "+(r.no||"")+" نهائياً. لن تُعاد قطع الغيار المصروفة إلى المخزن تلقائياً.",async()=>{
-          await Store.delPhoto(r.photoId); await Store.remove("records",r.id); toast("تم حذف السجل"); render();
+          await Store.delPhoto(r.site,r.photoId); await Store.remove("records",r.id); toast("تم حذف السجل"); render();
         });
       }},
       {label:"تعديل", cls:"btn", act:()=>{ closeModal(); go("neworder",{edit:r.id}); }}
@@ -1653,7 +1814,7 @@ async function openRecord(id){
     ),
     async onMount(root){
       if(!r.photoId) return;
-      const url=await Store.getPhoto(r.photoId);
+      const url=await Store.getPhoto(r.site,r.photoId);
       const slot=$("#recPhoto",root); if(!slot) return;
       slot.innerHTML = url ? '<img class="thumb" src="'+url+'" alt="صورة السيريال">'
                            : '<div class="ph-empty" style="width:100%"><span style="font-size:11.5px">تعذّر تحميل الصورة</span></div>';
@@ -1677,7 +1838,7 @@ function viewNewOrder(){
     Draft.gps = (rec && rec.gps) ? Object.assign({},rec.gps) : null;
     Draft.parts = rec ? (rec.parts||[]).map(p=>Object.assign({},p)) : [];
     App.params._init=true;
-    if(rec && rec.photoId) Store.getPhoto(rec.photoId).then(u=>{ Draft.photo=u; const s=$("#photoSlot"); if(s) renderPhotoSlot(s); });
+    if(rec && rec.photoId) Store.getPhoto(rec.site,rec.photoId).then(u=>{ Draft.photo=u; const s=$("#photoSlot"); if(s) renderPhotoSlot(s); });
   }
   const techs=Store.list("technicians").filter(t=>t.active!==false);
   const techNames=techs.filter(t=>!t.site||t.site==="كلا الموقعين"||t.site===site).map(t=>t.name);
@@ -1825,12 +1986,18 @@ async function saveOrder(rec){
   try{
     if(!obj.no) obj.no=await Store.nextNo(site,date);
     /* الصورة */
+    const oldSite = rec ? rec.site : site;
     if(Draft.photoDirty){
       if(Draft.photo){
+        if(obj.photoId && oldSite!==site) await Store.delPhoto(oldSite,obj.photoId);
         const pid=obj.photoId||uid("ph");
-        const okPhoto=await Store.savePhoto(pid,Draft.photo);
+        const okPhoto=await Store.savePhoto(site,pid,Draft.photo);
         obj.photoId = (okPhoto===false) ? null : pid;
-      }else if(obj.photoId){ await Store.delPhoto(obj.photoId); obj.photoId=null; }
+      }else if(obj.photoId){ await Store.delPhoto(oldSite,obj.photoId); obj.photoId=null; }
+    }else if(obj.photoId && oldSite!==site){
+      /* نُقل الأمر إلى موقع آخر: تنتقل صورته معه إلى قاعدة ذلك الموقع */
+      const url=await Store.getPhoto(oldSite,obj.photoId);
+      if(url){ await Store.savePhoto(site,obj.photoId,url); await Store.delPhoto(oldSite,obj.photoId); }
     }
     /* فروق قطع الغيار → حركات مخزن */
     const oldMap={}, newMap={};
@@ -2238,7 +2405,7 @@ async function sendReport(ym,note,opt){
 /* الإرسال التلقائي: عند أول دخول بعد نهاية الشهر تُرسل تقارير الأشهر المنتهية غير المرسلة */
 const AutoRep={done:{}, timer:null, running:false};
 function scheduleAutoReports(){
-  if(!Store.ready || !Access.in() || Access.isChief() || !Access.hasChief()) return;
+  if(!Store.ready || !Store.sitesReady || !Access.in() || Access.isChief() || !Access.hasChief()) return;
   clearTimeout(AutoRep.timer);
   AutoRep.timer=setTimeout(runAutoReports, 3000);
 }
@@ -2256,7 +2423,7 @@ async function runAutoReports(){
     for(let k=1;k<=3;k++){
       const ym=ymBack(k);
       if(!Store.list("records").some(r=>r.site===site && ymOf(r.date)===ym)) continue;
-      if(await Store.exists("reports", reportId(ym, SITE_CODE[site]))) continue;
+      if(await Store.exists("reports", reportId(ym, SITE_CODE[site]), site)) continue;
       await sendReport(ym, "", {auto:true, silent:true});
       sent++;
     }
@@ -2715,7 +2882,8 @@ async function pwChange(target,verifyKey,cur,a,b){
   return null;
 }
 const SECURITY_NOTE='<p class="note" style="margin-top:14px">كلمات السر تفصل الجهات على مستوى الاستخدام اليومي. '+
-  'هذه ليست حماية أمنية كاملة — البيانات كلها في قاعدة واحدة، ومن يملك خبرة تقنية ويصل إلى الرابط يستطيع تجاوزها. '+
+  'لكل موقع قاعدة بيانات منفصلة لا تُفتح إلا لجهته، وتُجمع القاعدتان عند رئيس القسم فقط. '+
+  'مع ذلك هذه ليست حماية أمنية كاملة — الفصل يتم داخل النظام، ومن يملك خبرة تقنية ويصل إلى الرابط يستطيع تجاوزه. '+
   'لحماية فعلية على مستوى الخادم يلزم ربط النظام بنظام دخول الوزارة.</p>';
 
 function viewSettings(){
@@ -2750,7 +2918,9 @@ function viewSettings(){
       '<section class="card"><div class="card-h"><h3>البيانات والنسخ الاحتياطي</h3></div><div class="card-b">'+
         '<dl class="kv" style="margin-bottom:14px">'+
           kv("جهة الدخول الحالية", Access.label())+
-          kv("طريقة التخزين", Store.mode==="db"?"قاعدة بيانات مشتركة — يراها كل من يفتح الرابط":"تخزين محلي على هذا المتصفح فقط")+
+          kv("طريقة التخزين", (Store.mode==="db"?"":"تخزين محلي على هذا المتصفح — ")+
+            (Store.open.length>1 ? "قاعدتا "+Store.openNames().join(" و")+" مجمّعتان لرئيس القسم"
+                                 : "قاعدة "+(Store.openNames()[0]||"الموقع")+" وحدها"))+
           kv("أوامر الصيانة",fmt(siteFilter(Store.list("records")).length))+
           kv("أصناف المخزن",fmt(siteFilter(Store.list("parts")).length))+
           kv("حركات المخزن",fmt(siteFilter(Store.list("movements")).length))+
@@ -2832,6 +3002,7 @@ function viewSettings(){
             confirmBox("استيراد البيانات","سيُضاف "+COLS.reduce((s,c2)=>s+((data[c2]||[]).length),0)+" سجلاً إلى البيانات الحالية.",async()=>{
               for(const c2 of COLS){ for(const row of (data[c2]||[])){
                 if(row.site && row.site!=="كلا الموقعين" && allowedSites().indexOf(row.site)<0) continue;
+                if(c2!=="technicians" && allowedSites().indexOf(row.site)<0) continue;
                 await Store.save(c2,row);
               } }
               if(data.config) await Store.saveConfig(Object.assign({},Store.config,data.config));
@@ -3832,6 +4003,8 @@ function render(){
   const g=$("#gate"); if(g) g.hidden=true;
   $(".app").hidden=false;
   if(!Access.bothSites() && App.site!==homeSite()) App.site=homeSite();
+  /* تُفتح قاعدة موقع الجهة وحدها — والقاعدتان لرئيس القسم */
+  Store.openSites(allowedSites());
   if(App.view==="chief" && !Access.isChief()) App.view="dashboard";
   if(App.view==="supervisor" && !canManageAny()) App.view="dashboard";
   renderNav(); renderTop();
@@ -3851,10 +4024,12 @@ function onStoreChange(){
       return;
     }
   }
+  Store.openSites(allowedSites());
   const busy = !$("#veil").hidden || App.view==="neworder";
   renderNav(); renderTop();
   $("#storeDot").classList.toggle("live", Store.mode==="db");
-  $("#storeDot").querySelector("span").textContent = Store.mode==="db" ? "بيانات مشتركة" : "تخزين محلي";
+  $("#storeDot").querySelector("span").textContent =
+    (Store.open.length>1 ? "القاعدتان مجمّعتان" : "قاعدة "+(Store.openNames()[0]||"الموقع")) + (Store.mode==="db" ? "" : " — محلي");
   if(!busy) render();
 }
 
