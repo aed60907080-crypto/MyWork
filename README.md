@@ -27,6 +27,36 @@ https://claude.ai/artifact/77xEND12PeCtC2XESgzGGJ
 - لوحة رئيس القسم: اعتماد الأوامر والتقارير الواردة
 - صفحة مشرف الفريق (المركز الحكومي): كلمات السر، الموظفون، الأقسام، قطع الغيار، مواقع العمل
 
+## Firebase (النسخة المحمية على الخادم)
+
+عند تعبئة `FIREBASE_CONFIG` داخل `index.html` يعمل النظام على **Firebase** من رابط GitHub Pages:
+الدخول بحساب Firebase لكل جهة، و**قواعد الأمان في `firestore.rules`** تمنع الخادم نفسه من إعطاء بيانات موقع لغير جهته.
+(نسخة claude.ai لا تستطيع الاتصال بـ Firebase وتبقى على قاعدتها الخاصة.)
+
+### خطوات الإعداد
+
+1. افتح https://console.firebase.google.com ← **Add project** ← اختر اسماً ← أكمل الإنشاء (Google Analytics غير لازم).
+2. **Build ← Firestore Database ← Create database** ← اختر **Production mode** ← أقرب موقع (مثل `me-central2`).
+3. **Build ← Authentication ← Get started ← Sign-in method ← Email/Password ← Enable ← Save**.
+4. **Authentication ← Settings ← User actions**: ألغِ تفعيل **Enable create (sign-up)** حتى لا يُنشئ أحد حساباً من خارج النظام.
+5. **Authentication ← Settings ← Authorized domains ← Add domain**: `aed60907080-crypto.github.io`
+6. **Project settings (⚙) ← General ← Your apps ← أيقونة الويب `</>`** ← سجّل التطبيق ← انسخ قيم `firebaseConfig`.
+7. **Authentication ← Users ← Add user** — أنشئ أربعة حسابات، و`authDomain` هو القيمة من الخطوة 6:
+
+| الجهة | البريد |
+|---|---|
+| المبنى الرئيسي | `main@<authDomain>` |
+| المركز الحكومي | `gov@<authDomain>` |
+| مشرف الفريق (المركز الحكومي) | `gov-supervisor@<authDomain>` |
+| رئيس القسم | `chief@<authDomain>` |
+
+   كلمة سر كل حساب ٦ أحرف على الأقل، وهي التي تُكتب في شاشة الدخول بعد اختيار الجهة.
+8. ضع قيم `firebaseConfig` في `FIREBASE_CONFIG` داخل `index.html`، واستبدل `YOUR-PROJECT.firebaseapp.com` في `firestore.rules` بقيمة `authDomain`.
+9. **Firestore Database ← Rules** ← الصق محتوى `firestore.rules` ← **Publish**.
+
+- تغيير كلمة السر: كل جهة من صفحة **الإعدادات** بعد الدخول بحسابها.
+- كلمة سر منسية: احذف الحساب من **Authentication ← Users** وأنشئه من جديد بالبريد نفسه.
+
 ## قواعد البيانات
 
 لكل موقع قاعدة بيانات مستقلة:

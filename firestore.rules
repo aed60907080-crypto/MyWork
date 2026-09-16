@@ -1,0 +1,40 @@
+rules_version = '2';
+
+// قواعد أمان سجل صيانة الأجهزة
+// استبدل YOUR-PROJECT.firebaseapp.com بقيمة authDomain لمشروعك قبل النشر.
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function email() {
+      return request.auth != null ? request.auth.token.email : '';
+    }
+    function isMain()  { return email() == 'main@YOUR-PROJECT.firebaseapp.com'; }
+    function isGov()   { return email() in ['gov@YOUR-PROJECT.firebaseapp.com',
+                                            'gov-supervisor@YOUR-PROJECT.firebaseapp.com']; }
+    function isChief() { return email() == 'chief@YOUR-PROJECT.firebaseapp.com'; }
+    function isStaff() { return isMain() || isGov() || isChief(); }
+
+    // قاعدة المبنى الرئيسي: موظفوه ورئيس القسم فقط
+    match /sites/MB/{path=**} {
+      allow read, write: if isMain() || isChief();
+    }
+
+    // قاعدة المركز الحكومي: موظفوه ومشرف الفريق ورئيس القسم فقط
+    match /sites/GC/{path=**} {
+      allow read, write: if isGov() || isChief();
+    }
+
+    // المشترك: القوائم واسم رئيس القسم والفنيون لكلا الموقعين
+    match /config/{doc} {
+      allow read, write: if isStaff();
+    }
+    match /technicians/{doc} {
+      allow read, write: if isStaff();
+    }
+
+    // أي مسار آخر مغلق
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

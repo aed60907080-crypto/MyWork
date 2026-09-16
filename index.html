@@ -621,6 +621,45 @@ if(!document.querySelector('meta[name="viewport"]')){
    ============================================================ */
 const SITES = ["المبنى الرئيسي","المركز الحكومي"];
 const SITE_CODE = {"المبنى الرئيسي":"MB","المركز الحكومي":"GC"};
+
+/* ============================================================
+   ربط Firebase — تُلصق هنا إعدادات تطبيق الويب من Project settings.
+   عند تركها فارغة يعمل النظام بالتخزين المحلي (أو بقاعدة claude.ai داخلها).
+   ============================================================ */
+const FIREBASE_CONFIG = {
+  apiKey: "",
+  authDomain: "",
+  projectId: "",
+  storageBucket: "",
+  messagingSenderId: "",
+  appId: ""
+};
+const FIREBASE_SDK = "https://www.gstatic.com/firebasejs/10.12.2/";
+/* حساب Firebase لكل جهة: <الاسم>@<authDomain> — تُنشأ من Authentication في Firebase Console */
+const ROLE_USER = {"المبنى الرئيسي":"main", "المركز الحكومي":"gov", "__admin":"gov-supervisor", "__chief":"chief"};
+function roleEmail(scope){ return ROLE_USER[scope] ? ROLE_USER[scope]+"@"+FIREBASE_CONFIG.authDomain : ""; }
+function scopeOfEmail(email){
+  email=String(email||"").toLowerCase();
+  return Object.keys(ROLE_USER).find(k=>roleEmail(k).toLowerCase()===email) || null;
+}
+function authMsg(code){
+  code=String(code||"");
+  if(/invalid-credential|wrong-password|user-not-found|invalid-login/.test(code)) return "كلمة السر غير صحيحة لهذه الجهة. تأكد من الجهة المختارة، ومن زر Caps Lock.";
+  if(/too-many-requests/.test(code)) return "محاولات كثيرة خاطئة — انتظر دقائق ثم حاول مرة أخرى.";
+  if(/network-request-failed/.test(code)) return "تعذّر الاتصال بالإنترنت — تحقّق من الشبكة ثم حاول مرة أخرى.";
+  if(/weak-password/.test(code)) return "كلمة السر ضعيفة — ٦ أحرف على الأقل.";
+  if(/requires-recent-login/.test(code)) return "انتهت صلاحية الجلسة — اخرج وادخل من جديد ثم غيّر كلمة السر.";
+  if(/user-disabled/.test(code)) return "هذا الحساب موقوف من Firebase Console.";
+  if(/operation-not-allowed/.test(code)) return "الدخول بالبريد وكلمة السر غير مفعّل في Firebase ← Authentication.";
+  return "تعذّر الدخول ("+code+").";
+}
+function loadScript(src){
+  return new Promise((res,rej)=>{
+    const s=document.createElement("script"); s.src=src; s.async=false;
+    s.onload=res; s.onerror=()=>rej(new Error("load "+src));
+    document.head.appendChild(s);
+  });
+}
 const MONTHS = ["يناير","فبراير","مارس","أبريل","مايو","يونيو","يوليو","أغسطس","سبتمبر","أكتوبر","نوفمبر","ديسمبر"];
 const STATUSES = ["مفتوح","قيد التنفيذ","بانتظار قطعة","منجز","ملغي"];
 const STATUS_TONE = {"مفتوح":"warn","قيد التنفيذ":"","بانتظار قطعة":"crit","منجز":"ok","ملغي":""};
@@ -771,7 +810,7 @@ const Store = {
   },
   async exists(col,id,site){
     const code=SITE_CODE[site]||"";
-    if(this.mode==="db"){
+    if(this.remote()){
       try{ const snap=await this.db.collection(colPath(col,code)).doc(id).get(); return !!snap.exists; }
       catch(e){ return true; } /* عند الشك لا نكتب فوق مستند قائم */
     }
@@ -782,9 +821,85 @@ const Store = {
     let db=null;
     try{ db = (window.claude && window.claude.use) ? await window.claude.use("db") : null; }catch(e){ db=null; }
     if(db){ this.db=db; this.mode="db"; await this._initDb(); }
+    else if(FIREBASE_CONFIG.apiKey){
+      this.mode="firebase";
+      try{ await this._initFirebase(); }
+      catch(e){ console.error(e); this.error="تعذّر الاتصال بـ Firebase — تحقّق من الإنترنت ثم أعد تحميل الصفحة."; }
+    }
     else { this.mode="local"; this._initLocal(); }
     this.ready=true; this.emit();
     if(this.mode==="db") this._migrateDb();
+  },
+  remote(){ return this.mode==="db" || this.mode==="firebase"; },
+
+  /* ---------- Firebase: الدخول بحساب لكل جهة، وقواعد الأمان على الخادم تفصل المواقع ---------- */
+  async _initFirebase(){
+    for(const f of ["firebase-app-compat.js","firebase-auth-compat.js","firebase-firestore-compat.js"]) await loadScript(FIREBASE_SDK+f);
+    firebase.initializeApp(FIREBASE_CONFIG);
+    this.db=firebase.firestore();
+    this.db.settings({ignoreUndefinedProperties:true});
+    this.auth=firebase.auth();
+    await new Promise(res=>{
+      let first=true;
+      this.auth.onAuthStateChanged(u=>{ this._onUser(u); if(first){ first=false; res(); } });
+    });
+  },
+  _onUser(u){
+    const scope=u ? scopeOfEmail(u.email) : null;
+    if(u && !scope){
+      this.auth.signOut().catch(()=>{});
+      if(this.ready) toast("هذا الحساب غير مرتبط بأي جهة في النظام");
+      return;
+    }
+    if(scope){
+      if(Access.state.scope!==scope) Access.adopt(scope);
+      this._sharedOn();
+    }else{
+      this._sharedOff();
+      if(Access.state.scope){ Access.state.scope=null; this.closeSites(true); }
+    }
+    if(this.ready) this.emit();
+  },
+  /* القوائم واسم رئيس القسم: تُقرأ بعد الدخول فقط */
+  _sharedOn(){
+    if(this._sharedUnsubs) return;
+    const cfgRef=this.db.doc("config/lists"), accRef=this.db.doc("config/access");
+    let seeded=false;
+    this._sharedUnsubs=[
+      cfgRef.onSnapshot(s=>{
+        if(s.exists) this.config=Object.assign(JSON.parse(JSON.stringify(DEFAULT_CONFIG)), s.data());
+        else if(!seeded && !s.metadata.fromCache){ seeded=true; cfgRef.set(this.config).catch(e=>console.warn("cfg-seed",e)); }
+        this.emit();
+      }, e=>console.warn("cfg-sub", e)),
+      accRef.onSnapshot(s=>{ this.access=s.exists ? (s.data()||{}) : {}; this.emit(); }, e=>console.warn("acc-sub", e))
+    ];
+  },
+  _sharedOff(){
+    (this._sharedUnsubs||[]).forEach(u=>{ try{ u(); }catch(e){} });
+    this._sharedUnsubs=null;
+    this.config=JSON.parse(JSON.stringify(DEFAULT_CONFIG)); this.access={};
+  },
+  async authSignIn(scope,pass,remember){
+    const email=roleEmail(scope);
+    try{
+      const P=firebase.auth.Auth.Persistence;
+      await this.auth.setPersistence(remember ? P.LOCAL : P.SESSION);
+    }catch(e){}
+    /* تجربة الكلمة كما كُتبت ثم بتخطيط لوحة المفاتيح الآخر */
+    const tries=[pass].concat([kbToArabic(pass), kbToLatin(pass)].filter((v,i,a)=>v && v!==pass && a.indexOf(v)===i));
+    for(let i=0;i<tries.length;i++){
+      try{ await this.auth.signInWithEmailAndPassword(email,tries[i]); return {ok:true, variant:i>0}; }
+      catch(e){ if(!/invalid-credential|wrong-password|invalid-login/.test(String(e&&e.code))) return {ok:false, msg:authMsg(e&&e.code)}; }
+    }
+    return {ok:false, msg:authMsg("auth/invalid-credential")};
+  },
+  async authChangePassword(cur,next){
+    const u=this.auth.currentUser;
+    if(!u) return "انتهت الجلسة — ادخل من جديد.";
+    try{ await u.reauthenticateWithCredential(firebase.auth.EmailAuthProvider.credential(u.email,cur)); }
+    catch(e){ return /invalid-credential|wrong-password/.test(String(e&&e.code)) ? "كلمة السر الحالية غير صحيحة." : authMsg(e&&e.code); }
+    try{ await u.updatePassword(next); return null; }
+    catch(e){ return authMsg(e&&e.code); }
   },
 
   /* ---------- القوائم وكلمات السر: مشتركة ---------- */
@@ -821,7 +936,7 @@ const Store = {
     codes.forEach(code=>COLS.forEach(col=>wanted.push([col,code])));
     wanted.push(["technicians",""]); /* الفنيون المشتركون بين الموقعين */
 
-    if(this.mode==="db"){
+    if(this.remote()){
       let pending=wanted.length;
       wanted.forEach(([col,code])=>{
         let q=this.db.collection(colPath(col,code));
@@ -952,7 +1067,7 @@ const Store = {
       throw new Error("save without site: "+col);
     }
     const prev=this._where(col,o.id);
-    if(this.mode==="db"){
+    if(this.remote()){
       const body=Object.assign({},o); delete body.id;
       await this.db.collection(colPath(col,code)).doc(o.id).set(body);
       /* نُقل إلى موقع آخر: يُحذف من قاعدة الموقع السابق */
@@ -973,7 +1088,7 @@ const Store = {
   async remove(col,id){
     const code=this._where(col,id);
     if(code===undefined) return;
-    if(this.mode==="db"){ await this.db.collection(colPath(col,code)).doc(id).delete(); }
+    if(this.remote()){ await this.db.collection(colPath(col,code)).doc(id).delete(); }
     else{
       this._parts[col][code]=this._parts[col][code].filter(x=>x.id!==id);
       this._flush(col,code); this._rebuild(col); this.emit();
@@ -981,13 +1096,13 @@ const Store = {
   },
   async saveConfig(cfg){
     this.config=cfg;
-    if(this.mode==="db"){ await this.db.doc("config/lists").set(cfg); }
+    if(this.remote()){ await this.db.doc("config/lists").set(cfg); }
     else{ try{ localStorage.setItem("mpw.config",JSON.stringify(cfg)); }catch(e){} }
     this.emit();
   },
   async saveAccess(acc){
     this.access=acc;
-    if(this.mode==="db"){ await this.db.doc("config/access").set(acc); }
+    if(this.remote()){ await this.db.doc("config/access").set(acc); }
     else{ try{ localStorage.setItem("mpw.access",JSON.stringify(acc)); }
           catch(e){ toast("تعذّر حفظ كلمات السر على هذا المتصفح"); } }
     this.emit();
@@ -996,7 +1111,7 @@ const Store = {
   /* ---------- الصور: مستند منفصل لكل صورة داخل قاعدة موقع السجل ---------- */
   async savePhoto(site,id,dataUrl){
     const code=SITE_CODE[site]||"";
-    if(this.mode==="db"){ await this.db.collection(colPath("photos",code)).doc(id).set({dataUrl:dataUrl, at:new Date().toISOString()}); }
+    if(this.remote()){ await this.db.collection(colPath("photos",code)).doc(id).set({dataUrl:dataUrl, at:new Date().toISOString()}); }
     else{
       try{ localStorage.setItem(this._key("photo."+id,code),dataUrl); }
       catch(e){ toast("تعذّر حفظ الصورة محلياً — حُفظ السجل بدونها"); return false; }
@@ -1005,7 +1120,7 @@ const Store = {
   async getPhoto(site,id){
     if(!id) return null;
     const code=SITE_CODE[site]||"";
-    if(this.mode==="db"){
+    if(this.remote()){
       try{ const s=await this.db.collection(colPath("photos",code)).doc(id).get(); return s.exists ? s.data().dataUrl : null; }
       catch(e){ return null; }
     }
@@ -1014,7 +1129,7 @@ const Store = {
   async delPhoto(site,id){
     if(!id) return;
     const code=SITE_CODE[site]||"";
-    if(this.mode==="db"){ try{ await this.db.collection(colPath("photos",code)).doc(id).delete(); }catch(e){} }
+    if(this.remote()){ try{ await this.db.collection(colPath("photos",code)).doc(id).delete(); }catch(e){} }
     else{ localStorage.removeItem(this._key("photo."+id,code)); localStorage.removeItem("mpw.photo."+id); }
   },
 
@@ -1024,6 +1139,20 @@ const Store = {
     const localMax = ()=> this.list("records")
       .filter(r=>String(r.no||"").indexOf(pre)===0)
       .reduce((m,r)=>Math.max(m, n(String(r.no).split("-")[2])),0);
+    if(this.mode==="firebase"){
+      const ref=this.db.doc("sites/"+SITE_CODE[site]+"/meta/counters");
+      try{
+        const next=await this.db.runTransaction(async tx=>{
+          const s=await tx.get(ref);
+          const data=(s.exists ? s.data() : {}) || {};
+          const nx=Math.max(n(data[pre]), localMax())+1;
+          const upd={}; upd[pre]=nx;
+          tx.set(ref, upd, {merge:true});
+          return nx;
+        });
+        return pre+String(next).padStart(4,"0");
+      }catch(e){ console.warn("counter", e); }
+    }
     if(this.mode==="db"){
       const ref=this.db.doc("sites/"+SITE_CODE[site]+"/meta/counters"), holder=uid("h");
       for(let i=0;i<4;i++){
@@ -1095,9 +1224,17 @@ const Access={
     return "f1:"+h.toString(16)+h2.toString(16);
   },
   entries(){ return (Store.access&&Store.access.entries)||{}; },
-  configured(){ const e=this.entries(); return !!(e[SITES[0]]&&e[SITES[1]]); },
-  hasAdmin(){ return !!this.entries()[ADMIN_KEY]; },
-  hasChief(){ return !!this.entries()[CHIEF_KEY]; },
+  /* في وضع Firebase: الحسابات تُنشأ من Firebase Console، فكل الجهات مضبوطة */
+  auth(){ return Store.mode==="firebase"; },
+  pwMin(){ return this.auth() ? 6 : 4; },
+  configured(){ if(this.auth()) return true; const e=this.entries(); return !!(e[SITES[0]]&&e[SITES[1]]); },
+  hasAdmin(){ return this.auth() || !!this.entries()[ADMIN_KEY]; },
+  hasChief(){ return this.auth() || !!this.entries()[CHIEF_KEY]; },
+  adopt(scope){
+    this.state.scope=scope;
+    App.site = scope===CHIEF_KEY ? "الكل" : (scope===ADMIN_KEY ? SITES[1] : scope);
+    if(scope===CHIEF_KEY && App.view==="dashboard") App.view="chief";
+  },
   chiefName(){ return ((Store.access||{}).chiefName||"").trim() || "رئيس قسم الصيانة"; },
   async setMany(pairs){
     const a=Store.access||{};
@@ -1121,6 +1258,7 @@ const Access={
     this.state.scope=scopeKey;
     App.site = scopeKey===CHIEF_KEY ? "الكل" : (scopeKey===ADMIN_KEY ? SITES[1] : scopeKey);
     if(scopeKey===CHIEF_KEY) App.view="chief";
+    if(this.auth()) return; /* جلسة Firebase تحفظ الدخول بنفسها */
     const payload=JSON.stringify({scope:scopeKey, at:Date.now()});
     try{ sessionStorage.setItem("mpw.session",payload); }catch(e){}
     try{ if(remember) localStorage.setItem("mpw.session",payload); else localStorage.removeItem("mpw.session"); }catch(e){}
@@ -1131,9 +1269,11 @@ const Access={
     try{ sessionStorage.removeItem("mpw.session"); }catch(e){}
     try{ localStorage.removeItem("mpw.session"); }catch(e){}
     Store.closeSites(true);
+    if(this.auth() && Store.auth) Store.auth.signOut().catch(()=>{});
     render();
   },
   restore(){
+    if(this.auth()) return; /* يستعيدها مستمع Firebase */
     let raw=null;
     try{ raw=sessionStorage.getItem("mpw.session"); }catch(e){}
     if(!raw){ try{ raw=localStorage.getItem("mpw.session"); }catch(e){} }
@@ -2870,6 +3010,14 @@ function openReportDoc(id){
    ============================================================ */
 /* تغيير كلمة سر جهة — يعيد نص الخطأ أو null عند النجاح */
 async function pwChange(target,verifyKey,cur,a,b){
+  if(Access.auth()){
+    /* Firebase: كل جهة تغيّر كلمة سر حسابها وحدها بعد التحقق بالكلمة الحالية */
+    if(target!==Access.state.scope) return "كلمة سر كل جهة تُغيَّر بعد الدخول بحسابها نفسه.";
+    if(a.length<6) return "كلمة السر الجديدة يجب ألا تقل عن ٦ أحرف.";
+    if(a!==b) return "كلمتا السر غير متطابقتين.";
+    if(!cur) return "أدخل كلمة السر الحالية.";
+    return await Store.authChangePassword(cur,a);
+  }
   if(a.length<4) return "كلمة السر الجديدة يجب ألا تقل عن ٤ أحرف.";
   if(a!==b) return "كلمتا السر غير متطابقتين.";
   if(!cur) return verifyKey===ADMIN_KEY ? "أدخل كلمة سر مشرف الفريق للتحقق." : "أدخل كلمة السر الحالية.";
@@ -2881,10 +3029,15 @@ async function pwChange(target,verifyKey,cur,a,b){
   await Access.setMany([[target,a]]);
   return null;
 }
-const SECURITY_NOTE='<p class="note" style="margin-top:14px">كلمات السر تفصل الجهات على مستوى الاستخدام اليومي. '+
+function securityNote(){
+  if(Access.auth()) return '<p class="note" style="margin-top:14px">الحماية مطبّقة على خادم Firebase: '+
+    'قواعد الأمان لا تسمح لحساب أي موقع بقراءة بيانات الموقع الآخر أو تعديلها، وحساب رئيس القسم وحده يصل إلى القاعدتين. '+
+    'إن نُسيت كلمة سر جهة: احذف حسابها من Firebase Console ← Authentication وأنشئه من جديد بالبريد نفسه.</p>';
+  return '<p class="note" style="margin-top:14px">كلمات السر تفصل الجهات على مستوى الاستخدام اليومي. '+
   'لكل موقع قاعدة بيانات منفصلة لا تُفتح إلا لجهته، وتُجمع القاعدتان عند رئيس القسم فقط. '+
   'مع ذلك هذه ليست حماية أمنية كاملة — الفصل يتم داخل النظام، ومن يملك خبرة تقنية ويصل إلى الرابط يستطيع تجاوزه. '+
-  'لحماية فعلية على مستوى الخادم يلزم ربط النظام بنظام دخول الوزارة.</p>';
+  'للحماية على مستوى الخادم استخدم نسخة Firebase.</p>';
+}
 
 function viewSettings(){
   const c=Store.config;
@@ -2918,7 +3071,7 @@ function viewSettings(){
       '<section class="card"><div class="card-h"><h3>البيانات والنسخ الاحتياطي</h3></div><div class="card-b">'+
         '<dl class="kv" style="margin-bottom:14px">'+
           kv("جهة الدخول الحالية", Access.label())+
-          kv("طريقة التخزين", (Store.mode==="db"?"":"تخزين محلي على هذا المتصفح — ")+
+          kv("طريقة التخزين", (Store.mode==="firebase"?"Firebase — ":(Store.mode==="db"?"":"تخزين محلي على هذا المتصفح — "))+
             (Store.open.length>1 ? "قاعدتا "+Store.openNames().join(" و")+" مجمّعتان لرئيس القسم"
                                  : "قاعدة "+(Store.openNames()[0]||"الموقع")+" وحدها"))+
           kv("أوامر الصيانة",fmt(siteFilter(Store.list("records")).length))+
@@ -2934,7 +3087,7 @@ function viewSettings(){
           (admin?'':' الاستيراد من صلاحية مشرف الفريق.')+'</p>'+
       '</div></section>'+
 
-      (admin
+      (admin && !Access.auth()
         ? '<section class="card"><div class="card-h"><h3>كلمات السر</h3><span class="chip">مشرف الفريق</span></div><div class="card-b">'+
             '<p style="margin:0 0 12px;color:var(--ink-2)">ضبط كلمة سر المركز الحكومي وكلمة سرك وتغييرهما من صفحة مشرف الفريق.</p>'+
             '<button class="btn" data-sup="passwords">إدارة كلمات السر</button></div></section>'
@@ -2942,14 +3095,16 @@ function viewSettings(){
             '<span class="chip'+(Access.bothSites()?"":" "+siteClass(Access.state.scope))+'">'+esc(Access.label())+'</span></div><div class="card-b">'+
             '<div class="grid-f">'+
               '<div class="field wide"><label>كلمة السر المراد تغييرها</label><input class="inp" value="'+esc(Access.label())+'" readonly>'+
-              '<span class="hint">تغيّر كلمة سرك وحدها — كلمات سر باقي الجهات بيد مشرف الفريق.</span></div>'+
+              '<span class="hint">'+(Access.auth()
+                ? 'تغيّر كلمة سر حساب «'+esc(Access.label())+'» في Firebase — كل جهة تغيّر كلمة سرها بعد الدخول بحسابها.'
+                : 'تغيّر كلمة سرك وحدها — كلمات سر باقي الجهات بيد مشرف الفريق.')+'</span></div>'+
               pwField("pwCur","كلمة السر الحالية",{auto:"current-password"})+
-              pwField("pwNew","كلمة السر الجديدة",{auto:"new-password", ph:"٤ أحرف على الأقل"})+
+              pwField("pwNew","كلمة السر الجديدة",{auto:"new-password", ph:(Access.auth()?"٦":"٤")+" أحرف على الأقل"})+
               pwField("pwNew2","تأكيد كلمة السر الجديدة",{auto:"new-password"})+
             '</div>'+
             '<div style="display:flex;gap:9px;margin-top:14px"><button class="btn pri" id="pwSave">تغيير كلمة السر</button></div>'+
             '<div class="gate-err" id="pwErr" style="margin-top:12px"></div>'+
-            SECURITY_NOTE+
+            securityNote()+
           '</div></section>')+
       ((Access.state.scope===SITES[1] && !Access.hasAdmin())
         ? '<section class="card"><div class="card-h"><h3>كلمة سر مشرف الفريق</h3><span class="chip warn">غير مضبوطة</span></div><div class="card-b">'+
@@ -3055,6 +3210,18 @@ function viewSupervisor(){
 
 /* ---- كلمات السر ---- */
 function supPasswords(){
+  if(Access.auth()){
+    const rows=[[SITES[1],roleEmail(SITES[1])],["مشرف الفريق",roleEmail(ADMIN_KEY)]];
+    return {
+      html:'<section class="card"><div class="card-h"><h3>حسابات المركز الحكومي</h3><span class="chip">Firebase</span></div><div class="card-b">'+
+        '<p style="margin:0 0 12px;color:var(--ink-2)">كلمات السر محفوظة في Firebase Authentication. كل جهة تغيّر كلمة سر حسابها من صفحة الإعدادات بعد الدخول به.</p>'+
+        simpleTable(["الجهة","بريد الحساب"], rows)+
+        '<div style="display:flex;gap:9px;margin-top:14px"><button class="btn" data-go-settings>تغيير كلمة سري ←</button></div>'+
+        securityNote()+
+      '</div></section>',
+      mount(root){ const b=$("[data-go-settings]",root); if(b) b.onclick=()=>go("settings"); }
+    };
+  }
   const e=Access.entries();
   return {
     html:'<section class="card"><div class="card-h"><h3>كلمات سر المركز الحكومي</h3></div><div class="card-b">'+
@@ -3074,7 +3241,7 @@ function supPasswords(){
         '</div>').join("")+
       '</div>'+
       '<div class="gate-err" id="pwErr" style="margin-top:12px"></div>'+
-      SECURITY_NOTE+
+      securityNote()+
     '</div></section>',
     mount(root){
       $$("[data-setpw]",root).forEach(b=>b.onclick=async()=>{
@@ -3863,6 +4030,11 @@ function renderGateInner(){
     g.innerHTML='<div class="gate-card">'+head+'<div class="gate-b"><p style="margin:0;color:var(--ink-2)">جارٍ الاتصال بقاعدة البيانات…</p></div></div>';
     return;
   }
+  if(Store.error){
+    g.innerHTML='<div class="gate-card">'+head+'<div class="gate-b"><div class="gate-err on">'+esc(Store.error)+'</div>'+
+      '<button class="btn pri" style="justify-content:center" onclick="location.reload()">إعادة المحاولة</button></div></div>';
+    return;
+  }
 
   /* أول تشغيل: ضبط كلمات السر */
   if(!Access.configured()){
@@ -3901,7 +4073,7 @@ function renderGateInner(){
   }
 
   /* شاشة الدخول */
-  const isSet = k => !!Access.entries()[k];
+  const isSet = k => Access.auth() || !!Access.entries()[k];
   const opts=[
     {k:SITES[0],  nm:SITES[0],       ds:"سجلات ومخزن وتقارير المبنى الرئيسي فقط"},
     {k:SITES[1],  nm:SITES[1],       ds:"سجلات ومخزن وتقارير المركز الحكومي فقط"},
@@ -3937,7 +4109,9 @@ function renderGateInner(){
       '<div class="gate-err" id="gErr"></div>'+
       '<button class="btn pri" id="gIn" style="justify-content:center">'+(first?"ضبط كلمة السر والدخول":"دخول")+'</button>'+
     '</div>'+
-    '<div class="gate-foot">كل جهة ترى بياناتها فقط، وتغيّر كلمة سرها من صفحة الإعدادات. مشرف الفريق يعيد ضبط كلمة سر المركز الحكومي.</div></div>';
+    '<div class="gate-foot">'+(Access.auth()
+      ? 'الدخول بحسابات Firebase — كل جهة ترى قاعدة موقعها فقط، والحماية مطبّقة على الخادم.'
+      : 'كل جهة ترى بياناتها فقط، وتغيّر كلمة سرها من صفحة الإعدادات. مشرف الفريق يعيد ضبط كلمة سر المركز الحكومي.')+'</div></div>';
 
   $$(".pick",g).forEach(b=>b.onclick=()=>{ gatePick=b.dataset.k; renderGate(); });
 
@@ -3960,6 +4134,10 @@ function renderGateInner(){
         }
       }
       await Access.setMany([[gatePick,pass]]);
+    }else if(Access.auth()){
+      const res=await Store.authSignIn(gatePick, pass, $("#gRem").checked);
+      layoutNote=res.variant;
+      if(!res.ok){ err(res.msg); $("#gIn").disabled=false; $("#gPass").select(); return; }
     }else{
       const res=await Access.checkAny(gatePick,pass);
       layoutNote=res.variant;
@@ -4027,9 +4205,9 @@ function onStoreChange(){
   Store.openSites(allowedSites());
   const busy = !$("#veil").hidden || App.view==="neworder";
   renderNav(); renderTop();
-  $("#storeDot").classList.toggle("live", Store.mode==="db");
+  $("#storeDot").classList.toggle("live", Store.remote());
   $("#storeDot").querySelector("span").textContent =
-    (Store.open.length>1 ? "القاعدتان مجمّعتان" : "قاعدة "+(Store.openNames()[0]||"الموقع")) + (Store.mode==="db" ? "" : " — محلي");
+    (Store.open.length>1 ? "القاعدتان مجمّعتان" : "قاعدة "+(Store.openNames()[0]||"الموقع")) + (Store.mode==="firebase" ? " · Firebase" : (Store.mode==="db" ? "" : " — محلي"));
   if(!busy) render();
 }
 
